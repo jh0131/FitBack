@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+@theme {
+  /* Primary (Purple) - 화면설계서 --p50~--p900 */
+  --color-primary-50: #eeedfe;
+  --color-primary-100: #cecbf6;
+  --color-primary-200: #afa9ec;
+  --color-primary-400: #7f77dd;
+  --color-primary-600: #534ab7;
+  --color-primary-800: #3c3489;
+  --color-primary-900: #26215c;
+
+  /* Error / Accent (Pink) - 화면설계서 --pk50~--pk800 */
+  --color-error-50: #fbeaf0;
+  --color-error-400: #d4537e;
+  --color-error-800: #72243e;
+
+  /* Neutral / Text / Background */
+  --color-border: #e4e2f0;
+  --color-bg-secondary: #f1eff9;
+  --color-bg: #f7f6fb;
+  --color-text: #1a1a1a;
+  --color-text-secondary: #6b6880;
+  --color-text-tertiary: #9e9bb0;
+
+  /* Font */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', Pretendard,
+    sans-serif;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+}
+
+.scrollbar-hide {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;  /* Firefox */
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none; /* Chrome, Safari and Opera */
+}

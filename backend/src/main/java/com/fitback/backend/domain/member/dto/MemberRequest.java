@@ -1,0 +1,103 @@
+package com.fitback.backend.domain.member.dto;
+
+import com.fitback.backend.global.validation.BCryptPassword;
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import jakarta.validation.constraints.Size;
+
+import java.util.List;
+
+// 회원 요청 DTO
+public class MemberRequest {
+
+    // 이메일 회원가입 요청
+    public record SignUpRequest(
+            @NotBlank(message = "이메일은 필수 입력값입니다.")
+            @Email(message = "올바른 이메일 형식이 아닙니다.")
+            String email,
+
+            @NotBlank(message = "비밀번호는 필수 입력값입니다.")
+            @Size(min = 8, max = 64, message = "비밀번호는 8~64자여야 합니다.")
+            @BCryptPassword
+            String password
+    ) {}
+
+    //이메일 로그인 요청
+    public record LoginRequest(
+            @NotBlank(message = "이메일은 필수 입력값입니다.")
+            @Email(message = "올바른 이메일 형식이 아닙니다.")
+            String email,
+
+            @NotBlank(message = "비밀번호는 필수 입력값입니다.")
+            String password
+    ) {}
+
+    //비밀번호 재설정 링크 요청
+    public record PasswordResetLinkRequest(
+            @NotBlank(message = "이메일은 필수 입력값입니다.")
+            @Email(message = "올바른 이메일 형식이 아닙니다.")
+            String email
+    ) {}
+
+    //비밀번호 재설정 요청
+    public record PasswordResetRequest(
+            @NotBlank(message = "재설정 토큰은 필수 입력값입니다.")
+            String resetToken,
+
+            @NotBlank(message = "새 비밀번호는 필수 입력값입니다.")
+            @Size(min = 8, max = 64, message = "새 비밀번호는 8~64자여야 합니다.")
+            @BCryptPassword
+            String newPassword
+    ) {}
+
+    //토큰 재발급
+    public record RefreshRequest(
+            @NotBlank(message = "Refresh Token은 필수 입니다.")
+            String refreshToken
+    ) {}
+
+    //회원정보 수정 (부분 수정: 전달된 필드만 반영, 미전송/null 필드는 기존 값 유지)
+    public record UpdateMemberRequest(
+            @Size(min = 2, max = 16, message = "닉네임은 2~16자여야 합니다.")
+            String nickname,
+            String profileImageId,
+            @Size(max = 5, message = "관심 태그는 최대 5개까지 선택할 수 있습니다.")
+            List<Long> tagIds
+    ) {}
+
+    //비밀번호 변경
+    public record ChangePasswordRequest (
+            @NotBlank(message = "현재 비밀번호는 필수 입력값 입니다.")
+            String currentPassword,
+
+            @NotBlank(message = "새 비밀번호는 필수 입력값 입니다.")
+            @Size(min = 8, max = 64, message = "새 비밀번호는 8~64자여야 합니다.")
+            @BCryptPassword
+            String newPassword
+    ){}
+
+    //회원 가입 프로필 설정
+    public record OnboardingRequest(
+            @NotBlank(message = "닉네임은 필수 입력값 입니다.")
+            @Size(min = 2, max = 16, message = "닉네임은 2~16자여야 합니다.")
+            String nickname,
+            String profileImageId,
+            @NotNull(message = "관심 태그 필드가 포함되어야 합니다. (빈 배열 허용)")
+            @Size(max = 5, message = "관심 태그는 최대 5개까지 선택할 수 있습니다.")
+            List<Long> tagIds
+    ) {}
+
+    //내 관심 태그 수정
+    public record UpdateTagsRequest(
+            @NotNull(message = "관심 태그 필드가 포함되어야 합니다. (빈 배열 허용)")
+            @Size(max = 5, message = "관심 태그는 최대 5개까지 선택할 수 있습니다.")
+            List<Long> tagIds
+    ) {}
+
+    //카카오 임시 토큰 교환
+    public record TokenExchangeRequest(
+            @NotBlank(message = "임시 토큰은 필수입니다.")
+            String tempToken
+    ) {}
+}

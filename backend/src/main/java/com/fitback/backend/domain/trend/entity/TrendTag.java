@@ -1,0 +1,73 @@
+package com.fitback.backend.domain.trend.entity;
+
+import com.fitback.backend.global.entity.BaseCreateTimeEntity;
+import com.fitback.backend.domain.tag.entity.Tag;
+import jakarta.persistence.Column;
+import jakarta.persistence.Entity;
+import jakarta.persistence.FetchType;
+import jakarta.persistence.GeneratedValue;
+import jakarta.persistence.GenerationType;
+import jakarta.persistence.Id;
+import jakarta.persistence.JoinColumn;
+import jakarta.persistence.ManyToOne;
+import jakarta.persistence.Table;
+import jakarta.persistence.UniqueConstraint;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import org.hibernate.annotations.OnDelete;
+import org.hibernate.annotations.OnDeleteAction;
+
+@Getter
+@Entity
+@Table(
+        name = "trend_tag",
+        uniqueConstraints = @UniqueConstraint(
+                name = "UK_TREND_TAG_TREND_ID_TAG_ID",
+                columnNames = {"trend_id", "tag_id"}
+        )
+)
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+public class TrendTag extends BaseCreateTimeEntity {
+
+    private static final int DEFAULT_RELEVANCE_WEIGHT = 1;
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    @Column(name = "trend_tag_id")
+    private Long id;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "trend_id", nullable = false)
+    @OnDelete(action = OnDeleteAction.CASCADE)
+    private TrendContent trend;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "tag_id", nullable = false)
+    private Tag tag;
+
+    // 트렌드와 공통 태그를 가진 룩북의 관련도 합산 점수로 사용
+    @Column(name = "relevance_weight", nullable = false)
+    private int relevanceWeight = DEFAULT_RELEVANCE_WEIGHT;
+
+    private TrendTag(TrendContent trend, Tag tag) {
+        this(trend, tag, DEFAULT_RELEVANCE_WEIGHT);
+    }
+
+    private TrendTag(TrendContent trend, Tag tag, int relevanceWeight) {
+        if (relevanceWeight <= 0) {
+            throw new IllegalArgumentException("relevanceWeight must be positive");
+        }
+        this.trend = trend;
+        this.tag = tag;
+        this.relevanceWeight = relevanceWeight;
+    }
+
+    public static TrendTag create(TrendContent trend, Tag tag) {
+        return new TrendTag(trend, tag);
+    }
+
+    public static TrendTag create(TrendContent trend, Tag tag, int relevanceWeight) {
+        return new TrendTag(trend, tag, relevanceWeight);
+    }
+}

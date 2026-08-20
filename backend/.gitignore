@@ -1,0 +1,63 @@
+HELP.md
+BACKEND_CONVENTION.md
+.gradle
+build/
+target/
+uploads/
+/checkpoint/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### OS ###
+.DS_Store
+Thumbs.db
+
+### Logs ###
+logs/
+*.log
+
+### Environment / Local config ###
+.env
+.env.*
+!.env.example
+/.local/
+application-local.properties
+application-local.yaml
+application-secret.properties
+application-secret.yml
+application-secret.yaml
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
+
+### Local planning documents ###
+/docs/RECOMMENDATION_PRODUCT_ROADMAP.md

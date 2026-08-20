@@ -1,0 +1,539 @@
+package com.fitback.backend.domain.member.service;
+
+
+import com.fitback.backend.domain.member.dto.MemberRequest;
+import com.fitback.backend.domain.member.dto.MemberResponse;
+import com.fitback.backend.domain.member.entity.LoginProvider;
+import com.fitback.backend.domain.member.entity.Member;
+import com.fitback.backend.domain.member.entity.MemberRole;
+import com.fitback.backend.domain.member.repository.MemberRepository;
+import com.fitback.backend.domain.notification.service.NotificationSettingService;
+import com.fitback.backend.global.exception.BusinessException;
+import com.fitback.backend.global.exception.ErrorCode;
+import com.fitback.backend.global.security.entity.AuthMember;
+import com.fitback.backend.global.security.token.TempTokenPayload;
+import com.fitback.backend.global.security.token.TempTokenStore;
+import com.fitback.backend.global.security.util.JwtUtil;
+import com.fitback.backend.global.util.HmacUtil;
+import org.hibernate.exception.ConstraintViolationException;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.Spy;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class AuthServiceTest {
+
+    private static final String REFRESH_TOKEN_HASH_CONTEXT = "refresh-token:";
+
+    @Mock
+    private PasswordEncoder passwordEncoder;
+    @Mock
+    private MemberRepository memberRepository;
+    @Mock
+    private JwtUtil jwtUtil;
+    @Spy
+    private HmacUtil hmacUtil = new HmacUtil("test-hmac-secret-key");
+    @Mock
+    private RejoinBlockChecker rejoinBlockChecker;
+    @Mock
+    private NotificationSettingService notificationSettingService;
+    @Mock
+    private TempTokenStore tempTokenStore;
+    @Mock
+    private MemberProfileImageService memberProfileImageService;
+    @Mock
+    private LoginAttemptService loginAttemptService;
+
+    //authService 실제 객체 생성 후 mock 객체 주입
+    @InjectMocks
+    private AuthService authService;
+
+    //id는 db에서 채우는데 실제 db를 사용하지 않으므로 id 강제 세팅
+    private Member createTestMember(Long id, String email, String encodedPassword){
+        Member member = Member.create(email, "test_user", encodedPassword, LoginProvider.EMAIL);
+        //id 강제 세팅
+        ReflectionTestUtils.setField(member, "id", id);
+        return member;
+    }
+
+    private String hashRefreshToken(String refreshToken) {
+        return hmacUtil.hashHex(REFRESH_TOKEN_HASH_CONTEXT + refreshToken);
+    }
+
+    //회원가입 성공 테스트
+    @Test
+    void signUpSuccessTest(){
+        MemberRequest.SignUpRequest request = new MemberRequest.SignUpRequest("Test@FITBACK.COM", "password123");
+
+        //given
+        //회원가입을 위해 중복 여부는 false가 반환되도록
+        when(memberRepository.existsByEmail("test@fitback.com")).thenReturn(false);
+        //재가입 차단 대상 아님
+        when(rejoinBlockChecker.isRejoinBlocked("test@fitback.com")).thenReturn(false);
+        when(memberRepository.existsByNickname(anyString())).thenReturn(false);
+        //테스트용 비밀번호
+        when(passwordEncoder.encode(request.password())).thenReturn("encodedPw");
+        //0번째 인자값 반환(member 객체)
+        when(memberRepository.saveAndFlush(any(Member.class))).thenAnswer(inv -> inv.getArgument(0));
+        //테스트용 토큰
+        when(jwtUtil.createAccessToken(any(AuthMember.class))).thenReturn("access-token");
+        when(jwtUtil.createRefreshToken(any(AuthMember.class))).thenReturn("refresh-token");
+
+        //when
+        MemberResponse.SignUpResponse response = authService.signUp(request);
+
+        //then
+        assertThat(response.accessToken()).isEqualTo("access-token");
+        assertThat(response.refreshToken()).isEqualTo("refresh-token");
+        assertThat(response.email()).isEqualTo("test@fitback.com");
+        assertThat(response.loginProvider()).isEqualTo(LoginProvider.EMAIL);
+        assertThat(response.role()).isEqualTo(MemberRole.USER);
+
+        //실제 저장된 member 필드 검증 (raw 아닌 암호화 비밀번호 포함)
+        ArgumentCaptor<Member> memberCaptor = ArgumentCaptor.forClass(Member.class);
+        verify(memberRepository).saveAndFlush(memberCaptor.capture());
+        Member savedMember = memberCaptor.getValue();
+        assertThat(savedMember.getEmail()).isEqualTo("test@fitback.com");
+        assertThat(savedMember.getPassword()).isEqualTo("encodedPw");
+        assertThat(savedMember.getLoginProvider()).isEqualTo(LoginProvider.EMAIL);
+        assertThat(savedMember.getRole()).isEqualTo(MemberRole.USER);
+        assertThat(savedMember.getRefreshTokenHash())
+                .isEqualTo(hashRefreshToken("refresh-token"));
+        verify(notificationSettingService).createDefaultSetting(savedMember);
+        verify(loginAttemptService).clear("test@fitback.com");
+    }
+
+    //회원가입 실패 - 이미 존재하는 이메일이면 EMAIL_ALREADY_EXISTS
+    @Test
+    void signUpduplicateEmailTest() {
+        MemberRequest.SignUpRequest request = new MemberRequest.SignUpRequest("Dup@FITBACK.COM", "password123");
+        //이메일 중복 검사 시 true 반환 설정
+        when(memberRepository.existsByEmail("dup@fitback.com")).thenReturn(true);
+
+        // 발생한 예외 타입이 BusinessException인지 해당 BusinessException의 ErrorCode가 EMAIL_ALREADY_EXISTS인지 검증
+        assertThatThrownBy(() -> authService.signUp(request))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.EMAIL_ALREADY_EXISTS));
+
+        //save가 한번도 호출되지 않았는지 검증
+        verify(memberRepository, never()).saveAndFlush(any(Member.class));
+        verify(notificationSettingService, never()).createDefaultSetting(any(Member.class));
+    }
+
+    //회원가입 실패 - 30일 재가입 차단 기간이면 REJOIN_BLOCKED
+    @Test
+    void signUpRejoinBlockedTest(){
+        MemberRequest.SignUpRequest request = new MemberRequest.SignUpRequest("Blocked@FITBACK.COM", "password123");
+        //이메일 중복은 아님
+        when(memberRepository.existsByEmail("blocked@fitback.com")).thenReturn(false);
+        //재가입 차단 대상 (만료 전 차단 기록 존재)
+        when(rejoinBlockChecker.isRejoinBlocked("blocked@fitback.com")).thenReturn(true);
+
+        //예외 타입과 ErrorCode가 REJOIN_BLOCKED인지 검증
+        assertThatThrownBy(() -> authService.signUp(request))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.REJOIN_BLOCKED));
+
+        //차단 시 save 미호출 검증
+        verify(memberRepository, never()).saveAndFlush(any(Member.class));
+        verify(notificationSettingService, never()).createDefaultSetting(any(Member.class));
+    }
+
+    //회원가입 실패 - 동시 요청으로 이메일 UNIQUE 제약이 충돌하면 EMAIL_ALREADY_EXISTS
+    @Test
+    void signUpConcurrentDuplicateEmailTest() {
+        MemberRequest.SignUpRequest request = new MemberRequest.SignUpRequest(
+                "Race@FITBACK.COM",
+                "password123"
+        );
+        ConstraintViolationException constraintViolation = mock(ConstraintViolationException.class);
+        when(constraintViolation.getConstraintName()).thenReturn("UK_MEMBER_EMAIL");
+
+        when(memberRepository.existsByEmail("race@fitback.com")).thenReturn(false);
+        when(rejoinBlockChecker.isRejoinBlocked("race@fitback.com")).thenReturn(false);
+        when(memberRepository.existsByNickname(anyString())).thenReturn(false);
+        when(passwordEncoder.encode(request.password())).thenReturn("encodedPw");
+        when(memberRepository.saveAndFlush(any(Member.class))).thenThrow(
+                new DataIntegrityViolationException("duplicate email", constraintViolation)
+        );
+
+        assertThatThrownBy(() -> authService.signUp(request))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.getErrorCode())
+                                .isEqualTo(ErrorCode.EMAIL_ALREADY_EXISTS));
+
+        verify(notificationSettingService, never()).createDefaultSetting(any(Member.class));
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+    }
+
+    //회원가입 실패 - 이메일 외 DB 제약 오류는 원인 보존
+    @Test
+    void signUpUnexpectedConstraintViolationTest() {
+        MemberRequest.SignUpRequest request = new MemberRequest.SignUpRequest(
+                "test@fitback.com",
+                "password123"
+        );
+        ConstraintViolationException constraintViolation = mock(ConstraintViolationException.class);
+        when(constraintViolation.getConstraintName()).thenReturn("UK_MEMBER_NICKNAME");
+        DataIntegrityViolationException unexpectedException =
+                new DataIntegrityViolationException("duplicate nickname", constraintViolation);
+
+        when(memberRepository.existsByEmail("test@fitback.com")).thenReturn(false);
+        when(rejoinBlockChecker.isRejoinBlocked("test@fitback.com")).thenReturn(false);
+        when(memberRepository.existsByNickname(anyString())).thenReturn(false);
+        when(passwordEncoder.encode(request.password())).thenReturn("encodedPw");
+        when(memberRepository.saveAndFlush(any(Member.class))).thenThrow(unexpectedException);
+
+        assertThatThrownBy(() -> authService.signUp(request)).isSameAs(unexpectedException);
+
+        verify(notificationSettingService, never()).createDefaultSetting(any(Member.class));
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+    }
+
+    @Test
+    void signUpRejectsPasswordOverBcryptByteLimitBeforeEncoding() {
+        MemberRequest.SignUpRequest request = new MemberRequest.SignUpRequest(
+                "test@fitback.com",
+                "가".repeat(25)
+        );
+
+        assertThatThrownBy(() -> authService.signUp(request))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.getErrorCode()).isEqualTo(ErrorCode.VALIDATION_ERROR)
+                );
+
+        verify(passwordEncoder, never()).encode(anyString());
+        verify(memberRepository, never()).existsByEmail(anyString());
+    }
+
+    //로그인 성공 테스트 - 자격 증명이 맞으면 토큰을 반환하고 refresh를 저장
+    @Test
+    void loginSuccessTest(){
+        MemberRequest.LoginRequest request = new MemberRequest.LoginRequest("Test@FITBACK.COM", "password123");
+        //id, 이메일, 암호화된 비밀번호를 가진 테스트 회원 생성
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+        member.changeProfileImageId("profile-image");
+
+        //given
+        //이메일로 회원 조회 시 위 회원 반환
+        when(memberRepository.findByEmail("test@fitback.com")).thenReturn(Optional.of(member));
+        //비밀번호 일치하도록 설정
+        when(passwordEncoder.matches(request.password(), "encodedPw")).thenReturn(true);
+        //테스트용 토큰
+        when(jwtUtil.createAccessToken(any(AuthMember.class))).thenReturn("access-token");
+        when(jwtUtil.createRefreshToken(any(AuthMember.class))).thenReturn("refresh-token");
+        when(memberProfileImageService.resolveProfileImageUrl(member))
+                .thenReturn("https://cdn.example.com/profile");
+
+        //when
+        MemberResponse.LoginResponse response = authService.login(request);
+
+        //then
+        assertThat(response.accessToken()).isEqualTo("access-token");
+        assertThat(response.memberId()).isEqualTo(1L);
+        assertThat(response.profileImageUrl()).isEqualTo("https://cdn.example.com/profile");
+        //발급한 refresh 토큰 원문이 아닌 HMAC 해시 저장 검증
+        assertThat(member.getRefreshTokenHash()).isEqualTo(hashRefreshToken("refresh-token"));
+        verify(loginAttemptService).assertLoginAllowed("test@fitback.com");
+        verify(loginAttemptService).clear("test@fitback.com");
+    }
+
+    //로그인 실패 테스트 - 이메일이 없으면 INVALID_CREDENTIALS
+    @Test
+    void loginEmailNotFoundTest(){
+        MemberRequest.LoginRequest request = new MemberRequest.LoginRequest("None@FITBACK.COM", "password123");
+
+        //이메일로 회원 조회 시 빈 Optional 반환
+        when(memberRepository.findByEmail("none@fitback.com")).thenReturn(Optional.empty());
+        when(loginAttemptService.recordFailure("none@fitback.com")).thenReturn(false);
+
+        //예외 타입과 ErrorCode가 INVALID_CREDENTIALS인지 검증
+        assertThatThrownBy(() -> authService.login(request))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.INVALID_CREDENTIALS));
+
+        //인증 실패 시 토큰 생성 미호출 검증
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+        // 미가입 이메일도 실제 회원과 같은 BCrypt 비교와 실패 누적 절차를 수행
+        verify(passwordEncoder).matches(eq("password123"), argThat(hash ->
+                hash != null && hash.startsWith("$2a$10$")
+        ));
+        verify(loginAttemptService).recordFailure("none@fitback.com");
+    }
+
+    //로그인 실패 - 비밀번호가 틀리면 INVALID_CREDENTIALS
+    @Test
+    void loginWrongPasswordTest(){
+        MemberRequest.LoginRequest request = new MemberRequest.LoginRequest("Test@FITBACK.COM", "wrongPw");
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+
+        when(memberRepository.findByEmail("test@fitback.com")).thenReturn(Optional.of(member));
+        //비밀번호 불일치하도록 설정
+        when(passwordEncoder.matches(request.password(), "encodedPw")).thenReturn(false);
+        when(loginAttemptService.recordFailure("test@fitback.com")).thenReturn(false);
+
+        //예외 타입과 ErrorCode가 INVALID_CREDENTIALS인지 검증
+        assertThatThrownBy(() -> authService.login(request))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.INVALID_CREDENTIALS));
+
+        //인증 실패 시 토큰 생성 미호출 검증
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+        verify(loginAttemptService).recordFailure("test@fitback.com");
+    }
+
+    // 이미 잠긴 이메일은 회원 조회와 BCrypt 비교 전에 즉시 차단
+    @Test
+    void loginLockedEmailTest() {
+        MemberRequest.LoginRequest request = new MemberRequest.LoginRequest(
+                "Locked@FITBACK.COM",
+                "password123"
+        );
+        doThrow(new BusinessException(ErrorCode.LOGIN_ATTEMPT_LOCKED))
+                .when(loginAttemptService)
+                .assertLoginAllowed("locked@fitback.com");
+
+        assertThatThrownBy(() -> authService.login(request))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.getErrorCode())
+                                .isEqualTo(ErrorCode.LOGIN_ATTEMPT_LOCKED)
+                );
+
+        verify(memberRepository, never()).findByEmail(anyString());
+        verify(passwordEncoder, never()).matches(anyString(), anyString());
+    }
+
+    // 다섯 번째 인증 실패 요청부터 기존 401 대신 로그인 잠금 429 오류 반환
+    @Test
+    void loginFifthFailureReturnsLockedErrorTest() {
+        MemberRequest.LoginRequest request = new MemberRequest.LoginRequest(
+                "Test@FITBACK.COM",
+                "wrongPw"
+        );
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+        when(memberRepository.findByEmail("test@fitback.com")).thenReturn(Optional.of(member));
+        when(passwordEncoder.matches("wrongPw", "encodedPw")).thenReturn(false);
+        when(loginAttemptService.recordFailure("test@fitback.com")).thenReturn(true);
+
+        assertThatThrownBy(() -> authService.login(request))
+                .isInstanceOfSatisfying(BusinessException.class, exception ->
+                        assertThat(exception.getErrorCode())
+                                .isEqualTo(ErrorCode.LOGIN_ATTEMPT_LOCKED)
+                );
+
+        verify(loginAttemptService).recordFailure("test@fitback.com");
+        verify(jwtUtil, never()).createAccessToken(any());
+    }
+
+    //토큰 재발급 성공 테스트 - 저장된 refresh 토큰과 일치하면 새 access, refresh 토큰
+    @Test
+    void refreshSuccessTest(){
+        String oldRefresh = "old-refresh";
+        MemberRequest.RefreshRequest request = new MemberRequest.RefreshRequest(oldRefresh);
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+        //회원에 기존 refresh 토큰의 HMAC 해시 저장
+        member.updateRefreshTokenHash(hashRefreshToken(oldRefresh));
+
+        //토큰 유효성, refresh 타입 검증을 통과하도록 설정
+        when(jwtUtil.isValid(oldRefresh)).thenReturn(true);
+        when(jwtUtil.isRefreshToken(oldRefresh)).thenReturn(true);
+        //토큰에서 이메일 추출
+        when(jwtUtil.getEmailFromToken(oldRefresh)).thenReturn("Test@FITBACK.COM");
+        when(memberRepository.findByEmail("test@fitback.com")).thenReturn(Optional.of(member));
+        //새로 발급될 토큰
+        when(jwtUtil.createAccessToken(any(AuthMember.class))).thenReturn("new-access");
+        when(jwtUtil.createRefreshToken(any(AuthMember.class))).thenReturn("new-refresh");
+
+        //when
+        MemberResponse.TokenResponse response = authService.refresh(request);
+
+        //then
+        assertThat(response.accessToken()).isEqualTo("new-access");
+        assertThat(response.refreshToken()).isEqualTo("new-refresh");
+        //회원의 refresh 토큰 해시가 새 토큰 기준으로 회전되었는지 검증
+        assertThat(member.getRefreshTokenHash()).isEqualTo(hashRefreshToken("new-refresh"));
+    }
+
+    //토큰 재발급 실패 테스트 - 유효하지 않은 토큰이면 INVALID_REFRESH_TOKEN
+    @Test
+    void refreshInvalidTokenTest(){
+        MemberRequest.RefreshRequest request = new MemberRequest.RefreshRequest("bad-token");
+
+        //토큰 유효성 검증 실패하도록 설정
+        when(jwtUtil.isValid("bad-token")).thenReturn(false);
+        //isValid가 false면 -> isRefreshToken은 호출되지 않음
+
+        //예외 타입과 ErrorCode가 INVALID_REFRESH_TOKEN인지 검증
+        assertThatThrownBy(() -> authService.refresh(request))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.INVALID_REFRESH_TOKEN));
+
+        //인증 실패 시 토큰 생성 미호출 검증
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+    }
+
+    //토큰 재발급 실패 테스트 - 저장된 토큰과 다르면 INVALID_REFRESH_TOKEN
+    @Test
+    void refreshTokenMismatchTest(){
+        String requestToken = "request-refresh";
+        MemberRequest.RefreshRequest request = new MemberRequest.RefreshRequest(requestToken);
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+        //회원에 저장된 refresh 토큰 해시는 요청 토큰과 다르게 설정
+        member.updateRefreshTokenHash(hashRefreshToken("stored-different-refresh"));
+
+        //given
+        when(jwtUtil.isValid(requestToken)).thenReturn(true);
+        when(jwtUtil.isRefreshToken(requestToken)).thenReturn(true);
+        when(jwtUtil.getEmailFromToken(requestToken)).thenReturn("Test@FITBACK.COM");
+        when(memberRepository.findByEmail("test@fitback.com")).thenReturn(Optional.of(member));
+
+        //요청 토큰과 저장된 토큰이 달라 예외 발생, ErrorCode가 INVALID_REFRESH_TOKEN인지 검증
+        assertThatThrownBy(() -> authService.refresh(request))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.INVALID_REFRESH_TOKEN));
+
+        //인증 실패 시 토큰 생성 미호출 검증
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+    }
+
+    //토큰 재발급 실패 테스트 - 저장된 해시가 없으면 INVALID_REFRESH_TOKEN
+    @Test
+    void refreshTokenHashMissingTest(){
+        String requestToken = "request-refresh";
+        MemberRequest.RefreshRequest request = new MemberRequest.RefreshRequest(requestToken);
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+
+        when(jwtUtil.isValid(requestToken)).thenReturn(true);
+        when(jwtUtil.isRefreshToken(requestToken)).thenReturn(true);
+        when(jwtUtil.getEmailFromToken(requestToken)).thenReturn("Test@FITBACK.COM");
+        when(memberRepository.findByEmail("test@fitback.com")).thenReturn(Optional.of(member));
+
+        assertThatThrownBy(() -> authService.refresh(request))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.INVALID_REFRESH_TOKEN));
+
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+    }
+
+    //로그아웃 성공 테스트 - refresh 토큰 초기화
+    @Test
+    void logoutSuccessTest(){
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+        //초기화 대상인 refresh 토큰 해시 저장
+        member.updateRefreshTokenHash(hashRefreshToken("some-refresh"));
+        //@AuthenticationPrincipal로 주입될 AuthMember 생성
+        AuthMember authMember = new AuthMember(member);
+
+        //given
+        when(memberRepository.findById(1L)).thenReturn(Optional.of(member));
+
+        //when
+        authService.logout(authMember);
+
+        //then
+        //refresh 토큰 해시가 null로 초기화되었는지 검증
+        assertThat(member.getRefreshTokenHash()).isNull();
+    }
+
+    //로그아웃 실패 테스트 - 회원이 없으면 NOT_FOUND
+    @Test
+    void logoutMemberNotFoundTest(){
+        Member member = createTestMember(1L, "test@fitback.com", "encodedPw");
+        AuthMember authMember = new AuthMember(member);
+
+        //회원 조회 시 빈 Optional 반환
+        when(memberRepository.findById(1L)).thenReturn(Optional.empty());
+
+        //예외 타입과 ErrorCode가 NOT_FOUND인지 검증
+        assertThatThrownBy(() -> authService.logout(authMember))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.NOT_FOUND));
+    }
+
+    //임시 토큰 교환 성공 테스트 - 유효한 임시 토큰이면 access/refresh 발급, refresh 저장, isNewMember 반환
+    @Test
+    void exchangeTokenSuccessTest(){
+        Member member = createTestMember(1L, "kakao@fitback.com", null);
+        //신규 카카오 가입자 임시 토큰
+        TempTokenPayload payload = new TempTokenPayload(1L, true);
+
+        //given
+        when(tempTokenStore.consume("temp-abc")).thenReturn(Optional.of(payload));
+        when(memberRepository.findById(1L)).thenReturn(Optional.of(member));
+        when(jwtUtil.createAccessToken(any(AuthMember.class))).thenReturn("access-token");
+        when(jwtUtil.createRefreshToken(any(AuthMember.class))).thenReturn("refresh-token");
+
+        //when
+        MemberResponse.TokenExchangeResponse response = authService.exchangeToken("temp-abc");
+
+        //then
+        assertThat(response.accessToken()).isEqualTo("access-token");
+        assertThat(response.refreshToken()).isEqualTo("refresh-token");
+        //payload의 신규 가입 여부가 그대로 전달
+        assertThat(response.isNewMember()).isTrue();
+        //발급한 refresh 토큰 원문이 아닌 HMAC 해시 저장 검증
+        assertThat(member.getRefreshTokenHash()).isEqualTo(hashRefreshToken("refresh-token"));
+    }
+
+    //임시 토큰 교환 실패 테스트 - 없거나 만료된 임시 토큰이면 INVALID_TEMP_TOKEN
+    @Test
+    void exchangeTokenInvalidTest(){
+        //consume 결과가 비어있음 (없거나 만료·재사용)
+        when(tempTokenStore.consume("bad-token")).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> authService.exchangeToken("bad-token"))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.INVALID_TEMP_TOKEN));
+
+        //토큰 발급 미호출 검증
+        verify(jwtUtil, never()).createAccessToken(any());
+        verify(jwtUtil, never()).createRefreshToken(any());
+    }
+
+    //임시 토큰 교환 실패 테스트 - 임시 토큰은 유효하나 회원이 없으면 NOT_FOUND
+    @Test
+    void exchangeTokenMemberNotFoundTest(){
+        //임시 토큰은 유효하지만 payload가 가리키는 회원이 삭제됨
+        when(tempTokenStore.consume("temp-abc")).thenReturn(Optional.of(new TempTokenPayload(99L, false)));
+        when(memberRepository.findById(99L)).thenReturn(Optional.empty());
+
+        assertThatThrownBy(() -> authService.exchangeToken("temp-abc"))
+                .isInstanceOfSatisfying(BusinessException.class, ex ->
+                        assertThat(ex.getErrorCode())
+                                .isEqualTo(ErrorCode.NOT_FOUND));
+
+        verify(jwtUtil, never()).createAccessToken(any());
+    }
+
+}

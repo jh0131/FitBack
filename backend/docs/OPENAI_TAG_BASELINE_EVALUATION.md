@@ -1,0 +1,138 @@
+# OpenAI 태그 baseline 평가
+
+`openAiTagEvaluation`은 FIT-BACK production API나 데이터베이스를 호출하거나 변경하지 않는다.
+승인된 이미지와 gold label을 로컬 경로에서 읽어 OpenAI Responses API만 직접 호출하며, 요청에는
+기존 클라이언트와 동일하게 `store=false`가 적용된다. 기존 `aiTagBlindEvaluation`은 수정하거나
+대체하지 않는다.
+
+## Gold label 준비
+
+저장소에는 커밋 가능한 안전 이미지 fixture가 없으므로
+`scripts/poc/ai-tag-evaluation/gold-labels.template.json`은 의도적으로 비어 있으며 JSON Schema의
+실행 가능한 dataset 예시는 아니다. 실제 이미지와
+gold label은 Git 밖의 단일 디렉터리에 둔다. 형식은
+[`gold-labels.schema.json`](../scripts/poc/ai-tag-evaluation/gold-labels.schema.json)을 따른다.
+이미지를 고르고 gold label을 확정하는 기준과 최소 범주 coverage는
+[`OPENAI_TAG_GOLD_DATASET_LABELING.md`](OPENAI_TAG_GOLD_DATASET_LABELING.md)를 따른다.
+
+```json
+{
+  "cases": [
+    {
+      "imageId": "<stable-image-id>",
+      "imagePath": "images/<image-file>.jpg",
+      "expectedCanonicalTags": [
+        {"type": "<TagType>", "name": "<approved-catalog-name>"}
+      ]
+    }
+  ]
+}
+```
+
+`imagePath`는 dataset JSON 파일의 디렉터리를 기준으로 한 상대 경로이며 JPEG, PNG, WebP만
+허용한다. `type`은 `SILHOUETTE`, `COLOR`, `DETAIL`, `STYLE`, `MATERIAL` 중 하나다. 모든
+기대 태그 `(type, name)`는 실행 시 전달하는 catalog JSON에 있어야 한다. gold label의 빈
+`cases`는 실행할 수 없으며, 이미지 파일과 임의 정답을 저장소에 추가해서는 안 된다.
+
+## 실행
+
+새 production-contract 평가는 V27 적용 후 47-tag taxonomy를 고정한
+[`canonical-catalog.production.json`](../scripts/poc/ai-tag-evaluation/canonical-catalog.production.json)을
+사용한다. [`canonical-catalog.v25.json`](../scripts/poc/ai-tag-evaluation/canonical-catalog.v25.json)은
+기존 43-tag historical baseline 재현용으로만 보존하며, 현재 production acceptance 근거로
+사용하지 않는다. API key와 실제 이미지 경로는 쉘의 보안된 환경변수 또는 비밀 관리 도구로만
+제공하며, 명령·로그·결과를 Git에 추가하지 않는다.
+
+```bash
+AI_TAG_EVALUATION_DATASET=/secure/path/gold-labels.json \
+AI_TAG_EVALUATION_CATALOG=scripts/poc/ai-tag-evaluation/canonical-catalog.production.json \
+FITBACK_AI_OPENAI_API_KEY=... \
+FITBACK_AI_OPENAI_MODEL=gpt-5.6-luna \
+FITBACK_AI_REQUEST_TIMEOUT=PT30S \
+./gradlew openAiTagEvaluation
+```
+
+기본 결과 파일은 `build/openai-tag-evaluation/openai-tag-evaluation.json`이며,
+`AI_TAG_EVALUATION_OUTPUT_DIR`로 변경할 수 있다.
+
+새 결과는 `reportSchemaVersion=2`와 `catalog.identityVersion=1`, `catalog.tagCount`,
+`catalog.sha256`을 기록한다. SHA-256은 evaluator가 실제로 읽은 catalog 파일의 exact bytes를
+대상으로 하므로, 결과가 어떤 catalog 입력으로 생성됐는지 이름 목록이나 파일 경로를 노출하지
+않고 재검증할 수 있다. 이 identity가 없는 기존 결과는 historical artifact이며 현재 gate의
+입력으로 인정하지 않는다.
+
+평가 runner는 dataset의 case 순서를 유지하고, 각 case가 성공 또는 실패로 끝난 뒤 마지막 case를
+제외한 모든 경계에서 정확히 `30s` 대기한다. 고정된 5-case validation에는 4회, 총 `120s`의
+inter-case pacing이 적용된다. 이 대기는 아래의 case 내부 provider retry sleep과 별도이며, 마지막
+case 뒤에는 대기하지 않는다. 성공 response의 token usage만으로는 적용 중인 TPM 한도나 실패 요청의
+token 차감 여부를 알 수 없으므로 token-aware 가변 대기는 사용하지 않는다. 이 고정 pacing은
+evaluator에만 적용되며 production `OpenAiTagModelClient` 호출 경로에는 적용되지 않는다.
+
+평가 runner는 동일한 prompt/request를 유지한 채 최대 2회 추가 시도한다. provider HTTP `500`,
+`502`, `503`, `504`와 HTTP `200`의 정확한 response parsing category
+`INVALID_MODEL_OUTPUT_JSON`은 첫 retry `250–500ms`, 두 번째 retry `500–1000ms`의 짧은
+exponential backoff+jitter를 사용한다. HTTP `429`는 evaluator에서만 다음 조건으로 제한한다.
+
+- `Retry-After` 또는 소진된 request/token/project-token 차원의 `x-ratelimit-reset-*` 대기값이
+  있으면 provider가 제시한 최소 대기시간을 줄이지 않고 `250–500ms` jitter를 더한다. 관측된
+  대기값이 `60s`를 넘으면 자동 retry하지 않는다.
+- 안전하게 분류된 `rate_limit_exceeded`인데 유효한 대기 header가 없으면 첫 retry `5–10s`,
+  두 번째 retry `10–20s`의 exponential backoff+jitter를 사용한다.
+- `credit_balance_exhausted`, organization/project spend limit, organization usage limit,
+  `insufficient_quota`는 대기로 해소되지 않으므로 retry하지 않는다. 알 수 없는 429도 유효한
+  대기 header가 없으면 retry하지 않는다.
+
+429·5xx·`INVALID_MODEL_OUTPUT_JSON` retry를 모두 합쳐 총 provider 시도는 최대 3회이고 retry sleep
+예산은 최대 `121s`다. 그 밖의 4xx, timeout·transport, response parsing·schema·canonical 실패는
+자동 retry하지 않는다. production `OpenAiTagModelClient`의 P1 정책은 그대로이며 429 또는
+`INVALID_MODEL_OUTPUT_JSON`을 retry하지 않는다. backoff 대기 중 인터럽트되면 남은 시도를 중단하고
+`EVALUATION_RETRY_INTERRUPTED`를 기록한다.
+
+## 결과 해석
+
+- `summary.micro`와 `summary.macro`는 canonical tag set 기준 precision, recall, F1이다. 실패한
+  호출은 예측이 없는 사례로 계산해, 결과가 과대평가되지 않게 한다.
+- `exactMatchCases`와 `exactMatchRate`는 기대 태그 set과 예측 tag set이 완전히 같은 사례의 수와 비율이다.
+- 각 사례의 `falseNegatives`는 누락 태그, `falsePositives`는 과잉 태그다.
+- summary와 각 사례의 `falseNegatives`, `falsePositives`, `unknownCanonicalTags`는 총 개수와
+  `(type, name)`별 빈도를 기록한다. unknown 출력은 동시에 false positive로 집계한다.
+- `latency`는 성공한 OpenAI 호출의 밀리초 집계다. `tokens.input`과 `tokens.output`은 OpenAI가 사용량을 반환한 호출만 합산하며, 미보고 사용량은 `null`이다.
+- 실패 사례의 `error`에는 `ANALYSIS409_1`, `EVALUATION_RETRY_INTERRUPTED` 같은 안전한 도메인
+  오류 코드 또는 입력/예상 밖 실패 category만 기록한다. raw 요청·응답·예외 메시지는 기록하지 않는다. 실패 사례는 baseline의
+  tag precision/recall/F1 및 exact match 계산에는 예측이 없는 사례로 포함한다. latency와 token
+  집계는 실제 OpenAI 응답을 받은 성공 호출만 사용한다.
+- 각 사례에는 총 호출 횟수 `attemptCount`와 최종 평가 상태 `finalStatus`(`SUCCESS` 또는 `FAILED`)를
+  기록한다. provider 실패 시 `providerHttpStatus`, `providerErrorCategory`, `responseParsingCategory`는
+  최종 시도의 안전한 메타데이터만 보존하며, raw response·API key·image bytes/data URL은 기록하지 않는다.
+- 각 provider 시도의 `attempts`에는 allowlist로 제한한 `providerErrorCode`와 숫자로 파싱·상한 검증한
+  `Retry-After`, `x-ratelimit-remaining-*`, `x-ratelimit-reset-*`만 기록할 수 있다. 임의 header,
+  provider error message/type, raw header 값은 기록하지 않는다.
+
+추천 rank 및 reasonCode 평가는 이 runner의 범위에 포함하지 않는다.
+
+## 오프라인 acceptance gate
+
+provider를 다시 호출하지 않고 기존 report를 판정할 때만 `openAiTagEvaluationGate`를 실행한다.
+이 task는 API key를 읽지 않으며 production API나 DB에도 접근하지 않는다.
+
+```bash
+AI_TAG_EVALUATION_REPORT=/secure/path/openai-tag-evaluation.json \
+AI_TAG_EVALUATION_CATALOG=scripts/poc/ai-tag-evaluation/canonical-catalog.production.json \
+./gradlew openAiTagEvaluationGate
+```
+
+gate는 report의 editable summary를 신뢰하지 않고 각 case의 expected/predicted set에서 TP, FP,
+FN과 micro metrics를 다시 계산한다. 다음 조건을 모두 만족해야 통과한다.
+
+- case 5개 모두 최종 `SUCCESS`; 최종 provider/parser failure 0; unknown canonical tag 0
+- 전체 FP ≤ 15, MATERIAL FP ≤ 1, MATERIAL+DETAIL+SILHOUETTE FP ≤ 10
+- micro precision ≥ 0.30, micro recall ≥ 0.5294, 전체 FN ≤ 8, micro F1 > 0.4000
+- `public-bottom-01`의 `DETAIL/포켓`과 `ai-bottom-02`의 `DETAIL/턱`이 각각 true positive
+- `outer-01`의 true positive가 1개 이상
+- report schema와 catalog SHA-256/tag count가 현재 production snapshot과 일치
+- catalog가 47개이며 타입별 개수가 STYLE 9, SILHOUETTE 12, MATERIAL 8, DETAIL 10,
+  COLOR 8과 일치. 불일치하면 `CATALOG_IDENTITY_MISMATCH`
+
+실패 시 gate는 고정 rule ID와 제한된 aggregate 값만 출력하며 report 원문, image path,
+request ID, raw provider body, API key 또는 model output을 출력하지 않는다. evaluator retry로
+일시적 provider 오류에서 복구한 case는 최종 failure metadata가 없고 `SUCCESS`이면 유효하다.

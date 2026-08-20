@@ -1,0 +1,176 @@
+package com.fitback.backend.global.health;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+import com.fitback.backend.global.security.CorsProperties;
+import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.bind.Binder;
+import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.core.env.Environment;
+import org.springframework.util.ClassUtils;
+
+class ProductionProfileConfigurationTest {
+
+    private final ApplicationContextRunner contextRunner = new ApplicationContextRunner()
+            .withInitializer(new ConfigDataApplicationContextInitializer())
+            .withPropertyValues(
+                    "spring.profiles.active=prod",
+                    "DB_URL=jdbc:mysql://production-db:3306/fitback",
+                    "DB_USER=fitback",
+                    "DB_PASSWORD=secret",
+                    "JWT_SECRET_KEY=production-jwt-secret-key-at-least-32-bytes",
+                    "HMAC_SECRET_KEY=production-hmac-secret-key-at-least-32-bytes",
+                    "AWS_REGION=ap-northeast-2",
+                    "IMAGE_BUCKET=fitback-prod-images",
+                    "IMAGE_CDN_BASE_URL=https://images.example.com",
+                    "CLOUDFRONT_KEY_PAIR_ID=TESTKEY",
+                    "CLOUDFRONT_PRIVATE_KEY_BASE64=dGVzdC1rZXk=",
+                    "FITBACK_AI_TAG_ANALYZER=openai",
+                    "FITBACK_AI_REQUEST_TIMEOUT=PT45S",
+                    "FITBACK_AI_OPENAI_API_KEY=test-openai-key",
+                    "FITBACK_AI_OPENAI_MODEL=test-openai-model",
+                    "FITBACK_AI_BEDROCK_MODEL_ID=test-bedrock-model",
+                    "KAKAO_REST_API_KEY=test-kakao-client-id",
+                    "KAKAO_REST_API_SECRET=test-kakao-client-secret",
+                    "FRONT_REDIRECT_URI=http://localhost:3000/oauth/success",
+                    "MAIL_EMAIL=test@fitback.com",
+                    "MAIL_APP_PASSWORD=test-mail-app-password",
+                    "FRONT_PASSWORD_RESET_URL=https://frontend.example.com/reset-password",
+                    "APP_CORS_ALLOWED_ORIGINS=https://frontend.example.com,http://localhost:5173"
+            );
+
+    @Test
+    void productionProfileMapsRequiredDatabaseEnvironmentVariables() {
+        contextRunner.run(context -> {
+            Environment environment = context.getEnvironment();
+
+            assertThat(environment.getActiveProfiles()).containsExactly("prod");
+            assertThat(environment.getProperty("spring.datasource.url"))
+                    .isEqualTo("jdbc:mysql://production-db:3306/fitback");
+            assertThat(environment.getProperty("spring.datasource.username")).isEqualTo("fitback");
+            assertThat(environment.getProperty("spring.datasource.password")).isEqualTo("secret");
+            assertThat(environment.getProperty("spring.jpa.hibernate.ddl-auto")).isEqualTo("validate");
+            assertThat(environment.getProperty("spring.jpa.open-in-view", Boolean.class)).isFalse();
+            assertThat(environment.getProperty("spring.sql.init.mode")).isEqualTo("never");
+            assertThat(environment.getProperty("spring.flyway.baseline-on-migrate", Boolean.class))
+                    .isTrue();
+            assertThat(environment.getProperty("spring.flyway.baseline-version"))
+                    .isEqualTo("0");
+            assertThat(environment.getProperty("jwt.token.secretKey"))
+                    .isEqualTo("production-jwt-secret-key-at-least-32-bytes");
+            assertThat(environment.getProperty("hmac.secret-key"))
+                    .isEqualTo("production-hmac-secret-key-at-least-32-bytes");
+            assertThat(environment.getProperty("image.storage.aws-region"))
+                    .isEqualTo("ap-northeast-2");
+            assertThat(environment.getProperty("image.storage.bucket"))
+                    .isEqualTo("fitback-prod-images");
+            assertThat(environment.getProperty("image.storage.cdn-base-url"))
+                    .isEqualTo("https://images.example.com");
+            assertThat(environment.getProperty("image.storage.cloudfront-key-pair-id"))
+                    .isEqualTo("TESTKEY");
+            assertThat(environment.getProperty("image.storage.cloudfront-private-key-base64"))
+                    .isEqualTo("dGVzdC1rZXk=");
+            assertThat(environment.getProperty("shopping.provider")).isEqualTo("fixture");
+            assertThat(environment.getProperty("shopping.shopify.enabled", Boolean.class))
+                    .isFalse();
+            assertThat(environment.getProperty("shopping.candidate-token.ttl"))
+                    .isEqualTo("PT10M");
+            assertThat(environment.getProperty("app.oauth.front-redirect-uri"))
+                    .isEqualTo("http://localhost:3000/oauth/success");
+            assertThat(environment.getProperty("spring.mail.username"))
+                    .isEqualTo("test@fitback.com");
+            assertThat(environment.getProperty("spring.mail.password"))
+                    .isEqualTo("test-mail-app-password");
+            assertThat(environment.getProperty(
+                    "spring.mail.properties.mail.smtp.connectiontimeout",
+                    Integer.class
+            )).isEqualTo(5000);
+            assertThat(environment.getProperty(
+                    "spring.mail.properties.mail.smtp.timeout",
+                    Integer.class
+            )).isEqualTo(3000);
+            assertThat(environment.getProperty(
+                    "spring.mail.properties.mail.smtp.writetimeout",
+                    Integer.class
+            )).isEqualTo(5000);
+            assertThat(environment.getProperty("management.health.mail.enabled", Boolean.class))
+                    .isFalse();
+            assertThat(environment.getProperty("app.password-reset.frontend-url"))
+                    .isEqualTo("https://frontend.example.com/reset-password");
+            assertThat(environment.getProperty("app.password-reset.sender-email"))
+                    .isEqualTo("test@fitback.com");
+            assertThat(environment.getProperty("app.password-reset.token-ttl"))
+                    .isEqualTo("5m");
+            assertThat(environment.getProperty("app.password-reset.request-cooldown"))
+                    .isEqualTo("1m");
+        });
+    }
+
+    @Test
+    void productionProfileMapsCorsAllowedOriginsEnvironmentVariable() {
+        contextRunner.run(context -> {
+            CorsProperties properties = Binder.get(context.getEnvironment())
+                    .bind("app.cors", CorsProperties.class)
+                    .orElseThrow(() -> new AssertionError("app.cors must be bound"));
+
+            assertThat(properties.allowedOrigins()).containsExactly(
+                    "https://frontend.example.com",
+                    "http://localhost:5173"
+            );
+        });
+    }
+
+    @Test
+    void productionProfileMapsAiProviderEnvironmentContract() {
+        contextRunner.run(context -> {
+            Environment environment = context.getEnvironment();
+
+            assertThat(environment.getProperty("fitback.ai.tag-analyzer")).isEqualTo("openai");
+            assertThat(environment.getProperty("fitback.ai.request-timeout"))
+                    .isEqualTo("PT45S");
+            assertThat(environment.getProperty("fitback.ai.openai.api-key"))
+                    .isEqualTo("test-openai-key");
+            assertThat(environment.getProperty("fitback.ai.openai.model"))
+                    .isEqualTo("test-openai-model");
+            assertThat(environment.getProperty("fitback.ai.bedrock.model-id"))
+                    .isEqualTo("test-bedrock-model");
+            assertThat(environment.getProperty("fitback.ai.bedrock.region"))
+                    .isEqualTo("ap-northeast-2");
+        });
+    }
+
+    @Test
+    void productionRuntimeIncludesFlywayAutoConfiguration() {
+        assertThat(ClassUtils.isPresent(
+                "org.springframework.boot.flyway.autoconfigure.FlywayAutoConfiguration",
+                getClass().getClassLoader()
+        )).isTrue();
+    }
+
+    @Test
+    void productionProfileUsesSpringForwardedHeaderSupport() {
+        contextRunner.run(context ->
+                assertThat(context.getEnvironment().getProperty("server.forward-headers-strategy"))
+                        .isEqualTo("framework"));
+    }
+
+    @Test
+    void productionProfileMapsKakaoAndOAuthEnvironmentVariables() {
+        contextRunner.run(context -> {
+            Environment environment = context.getEnvironment();
+
+            //카카오 클라이언트 자격정보는 env로 주입
+            assertThat(environment.getProperty("spring.security.oauth2.client.registration.kakao.client-id"))
+                    .isEqualTo("test-kakao-client-id");
+            assertThat(environment.getProperty("spring.security.oauth2.client.registration.kakao.client-secret"))
+                    .isEqualTo("test-kakao-client-secret");
+            //프론트 리다이렉트 주소는 env로 주입
+            assertThat(environment.getProperty("app.oauth.front-redirect-uri"))
+                    .isEqualTo("http://localhost:3000/oauth/success");
+            //임시 토큰 TTL은 고정값
+            assertThat(environment.getProperty("app.oauth.temp-token-ttl", Long.class))
+                    .isEqualTo(180000L);
+        });
+    }
+}

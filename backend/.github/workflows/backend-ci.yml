@@ -1,0 +1,251 @@
+name: Backend CI
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+  push:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Build and test backend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@1bcf9fb12cf4aa7d266a90ae39939e61372fe520 # v5.4.0
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Grant execute permission for Gradle
+        run: chmod +x gradlew
+
+      - name: Verify Backend CD output contract
+        shell: bash
+        run: |
+          ruby <<'RUBY'
+          require 'yaml'
+
+          workflow = YAML.safe_load(File.read('.github/workflows/backend-cd.yml'))
+          publish_job = workflow.dig('jobs', 'publish-image')
+          abort 'Backend CD publish-image job is missing.' unless publish_job.is_a?(Hash)
+
+          expression_open = '$' + '{{'
+          step_ids = Array(publish_job['steps'])
+            .select { |step| step.is_a?(Hash) }
+            .map { |step| step['id'] }
+          missing_step_ids = %w[push-image resolve-digest] - step_ids
+          unless missing_step_ids.empty?
+            abort "Backend CD required steps are missing: #{missing_step_ids.join(', ')}"
+          end
+
+          expected_outputs = {
+            'image-uri' => "#{expression_open} steps.push-image.outputs.image-uri }}",
+            'image-digest' => "#{expression_open} steps.resolve-digest.outputs.image-digest }}",
+            'image-reference' => "#{expression_open} steps.resolve-digest.outputs.image-reference }}"
+          }
+          actual_outputs = publish_job['outputs']
+
+          expected_outputs.each do |name, expected_value|
+            actual_value = actual_outputs.is_a?(Hash) ? actual_outputs[name] : nil
+            next if actual_value == expected_value
+
+            abort "Backend CD job output mapping is missing or invalid: #{name}"
+          end
+
+          credentials_step = Array(publish_job['steps']).find do |step|
+            step.is_a?(Hash) && step['uses'].to_s.start_with?('aws-actions/configure-aws-credentials@')
+          end
+          abort 'Backend CD AWS OIDC credentials action is missing.' unless credentials_step
+
+          mask_account_id = credentials_step&.dig('with', 'mask-aws-account-id')
+
+          if mask_account_id.to_s.casecmp('true').zero?
+            abort 'Backend CD cannot mask the AWS account ID while exporting ECR URI job outputs.'
+          end
+
+          publish_steps = Array(publish_job['steps'])
+          push_step = publish_steps.find { |step| step['name'] == 'Push image to Amazon ECR' }
+          push_script = push_step&.fetch('run', '').to_s
+
+          unless push_script.strip == 'bash scripts/ci/publish_ecr_image.sh'
+            abort 'Backend CD must use the tested ECR image publication script.'
+          end
+
+          validation_step = publish_steps.find do |step|
+            step['name'] == 'Start image validation container'
+          end
+          validation_script = validation_step&.fetch('run', '').to_s
+          required_validation_env = %w[
+            AWS_REGION
+            IMAGE_BUCKET
+            IMAGE_CDN_BASE_URL
+            CLOUDFRONT_KEY_PAIR_ID
+            CLOUDFRONT_PRIVATE_KEY_BASE64
+            KAKAO_REST_API_KEY
+            KAKAO_REST_API_SECRET
+            FRONT_REDIRECT_URI
+            MAIL_EMAIL
+            MAIL_APP_PASSWORD
+            FRONT_PASSWORD_RESET_URL
+            APP_CORS_ALLOWED_ORIGINS
+            FITBACK_AI_REQUEST_TIMEOUT
+            SPRING_FLYWAY_ENABLED
+          ]
+          missing_validation_env = required_validation_env.reject do |name|
+            validation_script.include?("--env #{name}=")
+          end
+          unless missing_validation_env.empty?
+            abort "Backend CD validation container is missing: #{missing_validation_env.join(', ')}"
+          end
+
+          deploy_job = workflow.dig('jobs', 'deploy-production')
+          abort 'Backend CD deploy-production job is missing.' unless deploy_job.is_a?(Hash)
+
+          unless deploy_job['needs'] == 'publish-image'
+            abort 'Backend CD deploy-production must depend on publish-image.'
+          end
+
+          deploy_condition = deploy_job['if'].to_s
+          unless deploy_condition.include?("vars.EC2_INSTANCE_ID != ''")
+            abort 'Backend CD deploy-production must skip without EC2_INSTANCE_ID.'
+          end
+
+          expected_image_reference = "#{expression_open} needs.publish-image.outputs.image-reference }}"
+          unless deploy_job.dig('env', 'IMAGE_REFERENCE') == expected_image_reference
+            abort 'Backend CD deploy-production must consume the digest-pinned image reference.'
+          end
+
+          expected_feature_env = {
+            'APP_CORS_ALLOWED_ORIGINS' => "#{expression_open} vars.APP_CORS_ALLOWED_ORIGINS }}",
+            'FITBACK_AI_TAG_ANALYZER' => "#{expression_open} vars.FITBACK_AI_TAG_ANALYZER || 'unavailable' }}",
+            'FITBACK_AI_REQUEST_TIMEOUT' => "#{expression_open} vars.FITBACK_AI_REQUEST_TIMEOUT || 'PT30S' }}",
+            'FITBACK_AI_OPENAI_MODEL' => "#{expression_open} vars.FITBACK_AI_OPENAI_MODEL || '' }}",
+            'FITBACK_AI_BEDROCK_MODEL_ID' => "#{expression_open} vars.FITBACK_AI_BEDROCK_MODEL_ID || '' }}",
+            'SHOPPING_PROVIDER' => "#{expression_open} vars.SHOPPING_PROVIDER || 'fixture' }}",
+            'SHOPIFY_ENABLED' => "#{expression_open} vars.SHOPIFY_ENABLED || 'false' }}"
+          }
+          expected_feature_env.each do |name, expected_value|
+            unless deploy_job.dig('env', name) == expected_value
+              abort "Backend CD feature setting is missing or unsafe: #{name}"
+            end
+          end
+
+          deploy_steps = Array(deploy_job['steps'])
+          payload_step = deploy_steps.find { |step| step['name'] == 'Build the SSM deployment payload' }
+          payload_script = payload_step&.fetch('run', '').to_s
+
+          unless payload_script.include?('executionTimeout: ["900"]')
+            abort 'Backend CD SSM payload must set a 900-second execution timeout.'
+          end
+
+          unless payload_script.include?('/opt/fitback/releases/') && payload_script.include?('RELEASE_DIR=')
+            abort 'Backend CD must deploy into an immutable release directory.'
+          end
+
+          unless payload_script.include?('deploy/compatibility/v31-refresh-token-hash')
+            abort 'Backend CD must bundle the V31 rollback compatibility marker.'
+          end
+
+          required_feature_payload = %w[
+            APP_CORS_ALLOWED_ORIGINS
+            FITBACK_AI_TAG_ANALYZER
+            FITBACK_AI_REQUEST_TIMEOUT
+            FITBACK_AI_OPENAI_MODEL
+            FITBACK_AI_BEDROCK_MODEL_ID
+            SHOPPING_PROVIDER
+            SHOPIFY_ENABLED
+          ]
+          missing_feature_payload = required_feature_payload.reject do |name|
+            payload_script.include?("#{name}=")
+          end
+          unless missing_feature_payload.empty?
+            abort "Backend CD SSM payload is missing feature settings: #{missing_feature_payload.join(', ')}"
+          end
+
+          if payload_script.include?('FITBACK_AI_OPENAI_API_KEY')
+            abort 'OpenAI API key must not be included in the GitHub SSM command payload.'
+          end
+
+          send_step = deploy_steps.find { |step| step['name'] == 'Send deployment command' }
+          send_script = send_step&.fetch('run', '').to_s
+          unless send_script.include?('--timeout-seconds 60')
+            abort 'Backend CD must use a bounded SSM delivery timeout.'
+          end
+
+          wait_step = deploy_steps.find { |step| step['name'] == 'Wait for deployment result' }
+          wait_script = wait_step&.fetch('run', '').to_s
+          unless wait_script.include?('for attempt in {1..205}') &&
+              wait_script.include?('cancel-command') &&
+              wait_script.include?('wait_for_terminal_after_cancellation')
+            abort 'Backend CD must monitor the full execution window and cancel on timeout.'
+          end
+          RUBY
+
+      - name: Test ECR image publication script
+        run: bash scripts/ci/test_publish_ecr_image.sh
+
+      - name: Test Nginx public entrypoint
+        run: bash scripts/ci/test_nginx_public_entrypoint.sh
+
+      - name: Test production backend observability contract
+        run: bash scripts/deploy/test_production_backend_observability.sh
+
+      - name: Test remote deployment script
+        run: bash scripts/deploy/test_remote_deploy.sh
+
+      - name: Verify MySQL migrations
+        run: bash scripts/ci/test_mysql_migrations.sh
+
+      - name: Build backend
+        run: ./gradlew clean build
+
+      - name: Upload test reports on failure
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backend-test-reports-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/reports/tests/test/**
+            build/test-results/test/**
+          if-no-files-found: warn
+          retention-days: 7
+
+  ci-gate:
+    name: CI Gate
+    if: ${{ always() }}
+    needs:
+      - verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify required jobs
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          if [ "$VERIFY_RESULT" != "success" ]; then
+            echo "Required job failed: verify=$VERIFY_RESULT"
+            exit 1
+          fi
+
+          echo "All required jobs passed."
