@@ -2,6 +2,95 @@
 
 FIT-BACK 서비스의 백엔드 레포지토리입니다.
 
+## 개인 기여 — jh0131
+
+### 담당 역할
+
+FIT-BACK 백엔드에서 **이미지 업로드·분석 리포트 파이프라인**과 **운영 배포 안정화**를
+중심으로 담당했습니다. 사용자가 올린 이미지를 안전하게 저장하고 분석 도메인과 연결하는
+과정부터, 운영 환경의 CORS·AI 공급자 설정·비밀값 전달·Flyway 복구까지 개발과 배포 사이의
+경계를 책임졌습니다.
+
+GitHub의 병합 이력을 기준으로 직접 작성한 PR은 7개입니다. 대규모 통합 PR은 팀 전체 변경을
+직접 구현했다는 의미가 아니라, 변경사항을 검증하고 운영 브랜치에 반영한 **릴리스 통합 역할**로
+구분했습니다.
+
+### 주요 기여
+
+| 영역 | 기여 내용 | 관련 PR |
+| --- | --- | --- |
+| 이미지 업로드 | Presigned POST 발급, 업로드 완료 확인, 재발급, 파일 형식·크기 검증 및 `imageId` 계약 구현 | [#79](https://github.com/FIT-BACK/backend/pull/79) |
+| 이미지 생명주기 | `PENDING_UPLOAD`부터 `DELETED`까지 상태 전이, 24시간 미사용 이미지 정리, 삭제 실패 재시도 구현 | [#79](https://github.com/FIT-BACK/backend/pull/79) |
+| 분석 리포트 | `imageId` 기반 분석 생성, 추천·확정 태그 저장, 목록·상세 조회와 Soft Delete 구현 | [#79](https://github.com/FIT-BACK/backend/pull/79) |
+| 운영 CORS | 허용 Origin을 `APP_CORS_ALLOWED_ORIGINS`로 환경변수화하고 Repository Variable → 원격 배포 → Docker Compose → Spring 전달 경로 연결 | [#216](https://github.com/FIT-BACK/backend/pull/216) |
+| AI 배포 계약 | OpenAI·Bedrock 분석기의 모델·timeout 설정을 `FITBACK_AI_*`로 통일하고 공급자별 필수값을 fail-closed로 검증 | [#241](https://github.com/FIT-BACK/backend/pull/241) |
+| 비밀값 보호 | OpenAI API key를 배포 payload와 release `.env`에서 제외하고 EC2가 Parameter Store SecureString에서 직접 조회하도록 구성 | [#241](https://github.com/FIT-BACK/backend/pull/241) |
+| 브랜치·릴리스 통합 | 코드 차이 없이 main/develop 이력을 동기화하고, 팀의 develop 변경을 production main에 반영하는 릴리스 PR 작성·검증 | [#215](https://github.com/FIT-BACK/backend/pull/215), [#242](https://github.com/FIT-BACK/backend/pull/242) |
+| 운영 장애 복구 | 운영에 적용된 Flyway V22 원문을 복원해 checksum 불일치와 AI 배포 실패를 해소 | [#245](https://github.com/FIT-BACK/backend/pull/245), [#246](https://github.com/FIT-BACK/backend/pull/246) |
+
+### 트러블슈팅과 해결 과정
+
+#### 1. 이미지 업로드와 DB 상태가 어긋나는 문제
+
+- **어려웠던 점:** 대용량 이미지를 백엔드가 직접 중계하면 서버 부하가 커지고, 클라이언트가
+  S3에 직접 올리면 업로드 성공 여부와 DB 상태가 어긋나거나 미사용 파일이 남을 수 있었습니다.
+- **해결:** 백엔드는 5분 유효한 Presigned POST와 `imageId`만 발급하고, 클라이언트가 S3에
+  직접 업로드한 뒤 완료 API를 호출하도록 분리했습니다. 이미지 상태 머신을 도입하고,
+  업로드 후 24시간 동안 도메인에 연결되지 않은 이미지는 스케줄러가 정리하도록 했습니다.
+  삭제 전 `DELETING` 상태로 선점하고 실패 시 `DELETE_FAILED`로 남겨 다음 실행에서 재시도해
+  중복 삭제와 유실 가능성을 낮췄습니다.
+- **검증:** 파일 시그니처·상태 전이·S3 정책·정리 스케줄러 테스트를 포함해 당시 전체 테스트
+  89개와 `./gradlew clean build`를 통과시켰습니다.
+
+#### 2. 로컬에서는 되지만 운영에서 발생하는 CORS 문제
+
+- **어려웠던 점:** 허용 Origin이 코드와 여러 배포 계층에 흩어져 있으면 프론트 주소가 바뀔 때
+  Spring 설정만 수정해서는 운영에 반영되지 않고, CloudFront·S3 CORS 문제와도 혼동하기
+  쉬웠습니다.
+- **해결:** `APP_CORS_ALLOWED_ORIGINS` 하나를 기준으로 GitHub Repository Variable, SSM 원격
+  배포 payload, release `.env`, Docker Compose, Spring 설정까지 연결했습니다. 애플리케이션
+  CORS와 S3·CloudFront·보안 그룹의 책임을 문서에서 분리하고 운영 설정 바인딩 회귀 테스트를
+  추가했습니다.
+- **검증:** Windows/WSL에서 Docker Compose 출력이 달라 로컬에서 끝까지 확인하지 못한 항목은
+  제한사항으로 기록하고, Linux CI의 배포 계약 검사와 Gradle 빌드로 교차 검증했습니다.
+
+#### 3. AI 공급자별 설정 차이와 비밀값 노출 위험
+
+- **어려웠던 점:** prototype·OpenAI·Bedrock 모드마다 필요한 model과 인증값이 달랐고, 설정이
+  누락된 채 배포되거나 API key가 workflow 로그·payload·배포 파일에 남을 위험이 있었습니다.
+- **해결:** 분석기 종류, model, timeout을 `FITBACK_AI_*` 계약으로 통일하고 공급자별 필수값이
+  없으면 배포가 중단되는 fail-closed 검증을 적용했습니다. OpenAI API key는 EC2 instance role로
+  Parameter Store SecureString에서 직접 읽게 해 GitHub Actions와 release `.env`를 통과하지
+  않도록 했습니다.
+- **검증:** ECR 발행, Nginx 진입점, 원격 배포, MySQL migration 계약 스크립트와 전체 Gradle
+  빌드, 민감정보 패턴 검사를 함께 실행했습니다.
+
+#### 4. 이미 운영에 적용된 Flyway migration의 checksum 불일치
+
+- **어려웠던 점:** 운영 DB에 적용된 V22 파일의 주석 한 줄이 이후 변경되면서 SQL 동작은 같아도
+  Flyway checksum이 달라졌고, production 배포의 `validate` 단계가 실패했습니다. 이미 적용된
+  versioned migration을 다시 수정하면 운영 이력을 더 복잡하게 만들 수 있었습니다.
+- **해결:** 새 migration을 덧붙이거나 checksum을 임의 보정하지 않고, 이전 production main의
+  V22 파일을 원문 그대로 복원했습니다. SQL 실행문과 데이터는 변경하지 않고 운영 이력과
+  저장소 원문만 다시 일치시켰습니다.
+- **검증:** 이전 운영 main과 파일 diff가 없음을 확인하고, MySQL에서 V1~V25 migration을 순서대로
+  적용한 뒤 전체 빌드와 배포 health를 재확인했습니다.
+
+#### 5. main과 develop의 이력 분기
+
+- **어려웠던 점:** production 릴리스가 main에 먼저 병합되면서 코드 내용은 같지만 merge 이력이
+  develop과 달라졌고, 다음 릴리스에서 불필요한 충돌이나 중복 커밋이 발생할 수 있었습니다.
+- **해결:** 파일 변경이 없는 이력 동기화 PR을 별도로 만들어 main의 릴리스 이력만 develop에
+  반영했습니다. 이후 develop → main 통합 PR에서는 포함 커밋, migration 순서, 운영 변수,
+  health·rollback 영향을 명시해 기능 개발과 릴리스 책임을 분리했습니다.
+
+### 작업 원칙
+
+- 기능 구현뿐 아니라 테스트, migration, 배포 스크립트, 운영 문서를 하나의 변경 단위로 관리했습니다.
+- 운영 비밀값이 코드·문서·로그·workflow payload에 남지 않는지 별도로 검사했습니다.
+- 로컬 환경에서 재현할 수 없는 검증은 성공으로 간주하지 않고, 제한사항과 CI·운영 확인 항목을
+  PR에 명시했습니다.
+
 ## 기술 스택
 
 - Java 21
